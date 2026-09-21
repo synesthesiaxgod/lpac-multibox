@@ -80,7 +80,14 @@ static void RefreshExtraPids() {
 }
 
 static DWORD WINAPI WatchThread(LPVOID) {
-    while (!g_watchStop) { RefreshExtraPids(); Sleep(2000); }
+    while (!g_watchStop) {
+        RefreshExtraPids();
+        bool hasPid = false;
+        EnterCriticalSection(&g_cs);
+        hasPid = !g_extraPids.empty();
+        LeaveCriticalSection(&g_cs);
+        Sleep(hasPid ? 1000 : 100);
+    }
     return 0;
 }
 
