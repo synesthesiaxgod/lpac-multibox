@@ -138,6 +138,23 @@ static DWORD FindNewProcessByName(const std::wstring& procName, const std::set<D
 struct ProcInfo { DWORD pid = 0; HG hProcess; HG hThread; };
 struct Container { int id = 0; HG hJob; ProcInfo launcher; ProcInfo game; };
 
+struct Config {
+    int instances = 1;
+    std::wstring gameDir;
+    std::wstring gameExe = L"GenshinImpact.exe";
+    std::wstring launcherPath;
+    std::wstring dllPath;
+    std::wstring launcherArgs;
+    std::wstring sbPath = L"C:\\Program Files\\Sandboxie-Plus\\Start.exe";
+    DWORD launcherDelay = 3000;
+    DWORD pairDelay    = 5000;
+    bool autoGames = false;
+    DWORD autoDelay = 25000;
+    bool noCopy = false;
+    bool batchMode = true; // default: start all launchers first, then games
+    std::vector<std::wstring> boxes;
+};
+
 static ProcInfo LaunchLauncher(
     const std::wstring& exe, const std::wstring& args, const std::wstring& cwd,
     HANDLE hJob, int jobId, const std::wstring& dllPath)
@@ -162,14 +179,31 @@ static ProcInfo LaunchLauncher(
     return { pi.dwProcessId, HG(pi.hProcess), HG(pi.hThread) };
 }
 
-static ProcInfo LaunchGameInSandbox(
+typedef LONG (__stdcall *pfnSbieApi_QueryProcess)(
+    HANDLE process_id,
+    WCHAR *box_name,
+    WCHAR *image_name,
+    WCHAR *sid_string,
+    ULONG *session_id
+);
+
+static pfnSbieApi_QueryProcess LoadSbieApi(const std::wstring& sbPath) {
+    fs::path sbDir = fs::path(sbPath).parent_path();
+    HMODULE hDll = LoadLibraryW((sbDir / L"SbieDll.dll").c_str());
+    if (!hDll) {
+        hDll = LoadLibraryW(L"SbieDll.dll");
+    }
+    if (hDll) {
+        return (pfnSbieApi_QueryProcess)GetProcAddress(hDll, "SbieApi_QueryProcess");
+    }
+    return nullptr;
+}
+
+static ProcInfo StartGameInSandbox(
     const std::wstring& sbStartExe,
     const std::wstring& gameExePath,
     const std::wstring& gameDir,
-    int jobId,
-    const std::wstring& boxName,
-    const std::wstring& gameExeName,
-    std::set<DWORD>& knownPids)
+    const std::wstring& boxName)
 {
     std::wstring cmdLine = L"\"" + sbStartExe + L"\"";
     cmdLine += L" /box:" + boxName;
@@ -187,45 +221,132 @@ static ProcInfo LaunchGameInSandbox(
         CREATE_NEW_CONSOLE, nullptr, gameDir.c_str(), &si, &pi))
         Throw("CreateProcessW (Sandboxie Start)");
 
+    return { pi.dwProcessId, HG(pi.hProcess), HG(pi.hThread) };
+}
+
+static ProcInfo LaunchGameInSandbox(
+    const std::wstring& sbStartExe,
+    const std::wstring& gameExePath,
+    const std::wstring& gameDir,
+    int jobId,
+    const std::wstring& boxName,
+    const std::wstring& gameExeName,
+    std::set<DWORD>& knownPids,
+    pfnSbieApi_QueryProcess sbieQuery)
+{
+    ProcInfo pi = StartGameInSandbox(sbStartExe, gameExePath, gameDir, boxName);
+
     std::wcout << L"      Waiting for game process..." << std::endl;
-    Sleep(6000);
 
     DWORD gamePid = 0;
-    for (int attempt = 0; attempt < 8 && !gamePid; attempt++) {
-        gamePid = FindNewProcessByName(gameExeName, knownPids);
-        if (!gamePid) {
-            std::wcout << L"      [WAIT] Not found yet, attempt " << (attempt+1) << std::endl;
-            Sleep(3000);
+    DWORD startTick = GetTickCount();
+    while (!gamePid && (GetTickCount() - startTick < 25000)) {
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe = {}; pe.dwSize = sizeof(pe);
+            if (Process32FirstW(hSnap, &pe)) {
+                do {
+                    if (_wcsicmp(pe.szExeFile, gameExeName.c_str()) == 0 && !knownPids.count(pe.th32ProcessID)) {
+                        bool match = true;
+                        if (sbieQuery) {
+                            WCHAR b[34] = {};
+                            if (sbieQuery((HANDLE)(DWORD_PTR)pe.th32ProcessID, b, nullptr, nullptr, nullptr) == 0) {
+                                match = (_wcsicmp(b, boxName.c_str()) == 0);
+                            }
+                        }
+                        if (match) {
+                            gamePid = pe.th32ProcessID;
+                            break;
+                        }
+                    }
+                } while (Process32NextW(hSnap, &pe));
+            }
+            CloseHandle(hSnap);
         }
+        if (!gamePid) Sleep(100);
     }
 
     if (gamePid) {
         std::wcout << L"      [FOUND] Game PID: " << gamePid << std::endl;
         WriteGamePidFile(jobId, gamePid);
         knownPids.insert(gamePid);
-        std::wcout << L"      [OK] isolate.dll will be loaded via Sandboxie.ini InjectDll" << std::endl;
     } else {
-        std::wcout << L"      [ERR] Game process not found!" << std::endl;
+        std::wcout << L"      [ERR] Game process not found within timeout!" << std::endl;
     }
 
-    return { pi.dwProcessId, HG(pi.hProcess), HG(pi.hThread) };
+    return pi;
 }
 
-struct Config {
-    int instances = 1;
-    std::wstring gameDir;
-    std::wstring gameExe = L"GenshinImpact.exe";
-    std::wstring launcherPath;
-    std::wstring dllPath;
-    std::wstring launcherArgs;
-    std::wstring sbPath = L"C:\\Program Files\\Sandboxie-Plus\\Start.exe";
-    DWORD launcherDelay = 3000;
-    DWORD pairDelay    = 15000;
-    bool autoGames = false;
-    DWORD autoDelay = 25000;
-    bool noCopy = false;
-    std::vector<std::wstring> boxes;
-};
+static void ResolveAllGamePids(
+    const Config& cfg,
+    std::vector<Container>& containers,
+    std::set<DWORD>& knownGamePids,
+    pfnSbieApi_QueryProcess sbieQuery)
+{
+    int resolved = 0;
+    std::vector<DWORD> foundPids(cfg.instances, 0);
+    DWORD startTime = GetTickCount();
+
+    std::wcout << L"  [POLL] Watching for " << cfg.instances << L" game processes..." << std::endl;
+
+    while (resolved < cfg.instances && (GetTickCount() - startTime < 35000)) {
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe = {}; pe.dwSize = sizeof(pe);
+            if (Process32FirstW(hSnap, &pe)) {
+                do {
+                    if (_wcsicmp(pe.szExeFile, cfg.gameExe.c_str()) == 0) {
+                        DWORD pid = pe.th32ProcessID;
+                        if (!knownGamePids.count(pid)) {
+                            int matchedIdx = -1;
+                            if (sbieQuery) {
+                                WCHAR boxName[34] = {};
+                                if (sbieQuery((HANDLE)(DWORD_PTR)pid, boxName, nullptr, nullptr, nullptr) == 0) {
+                                    for (int i = 0; i < cfg.instances; i++) {
+                                        if (foundPids[i] == 0 && _wcsicmp(boxName, cfg.boxes[i].c_str()) == 0) {
+                                            matchedIdx = i;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (matchedIdx == -1 && !sbieQuery) {
+                                for (int i = 0; i < cfg.instances; i++) {
+                                    if (foundPids[i] == 0) {
+                                        matchedIdx = i;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (matchedIdx != -1) {
+                                foundPids[matchedIdx] = pid;
+                                knownGamePids.insert(pid);
+                                containers[matchedIdx].game.pid = pid;
+                                WriteGamePidFile(matchedIdx, pid);
+                                std::wcout << L"  [MATCHED] Box \"" << cfg.boxes[matchedIdx]
+                                           << L"\" (ID " << matchedIdx << L") -> Game PID " << pid
+                                           << L" -> %TEMP%\\multibox_game_pid_" << matchedIdx << L".tmp" << std::endl;
+                                resolved++;
+                            }
+                        }
+                    }
+                } while (Process32NextW(hSnap, &pe));
+            }
+            CloseHandle(hSnap);
+        }
+        if (resolved < cfg.instances) Sleep(100);
+    }
+
+    if (resolved < cfg.instances) {
+        std::wcerr << L"  [WARN] Only resolved " << resolved << L" of " << cfg.instances << L" game processes.\n";
+    } else {
+        std::wcout << L"  [SUCCESS] All " << resolved << L" game PIDs written to %TEMP%\\multibox_game_pid_<ID>.tmp!\n";
+    }
+}
+
+
 
 static Config parseArgs(int argc, wchar_t* argv[]) {
     Config c;
@@ -243,6 +364,8 @@ static Config parseArgs(int argc, wchar_t* argv[]) {
         else if (a == L"--auto")                          c.autoGames = true;
         else if (a == L"--auto-delay" && i+1 < argc)     { c.autoGames = true; c.autoDelay = _wtoi(argv[++i]); }
         else if (a == L"--no-copy")                       c.noCopy = true;
+        else if (a == L"--batch")                         c.batchMode = true;
+        else if (a == L"--pair")                          c.batchMode = false;
         else if (a == L"--box" && i+1 < argc)            c.boxes.push_back(argv[++i]);
     }
     return c;
@@ -330,6 +453,7 @@ int wmain(int argc, wchar_t* argv[]) {
     fs::path gameExe = fs::path(cfg.gameDir) / cfg.gameExe;
 
     std::wcout << L"  Instances:    " << cfg.instances << std::endl;
+    std::wcout << L"  Mode:         " << (cfg.batchMode ? L"BATCH (launch all launchers first, then games)" : L"PAIR (sequential launcher + game)") << std::endl;
     std::wcout << L"  Sandboxie:    " << cfg.sbPath << std::endl;
     std::wcout << L"  Boxes:        ";
     for (int i = 0; i < cfg.instances; i++) {
@@ -356,53 +480,127 @@ int wmain(int argc, wchar_t* argv[]) {
     std::vector<Container> containers(cfg.instances);
     std::set<DWORD> knownGamePids;
 
-    try {
-        for (int i = 0; i < cfg.instances && !g_stop; i++) {
+    pfnSbieApi_QueryProcess sbieQuery = LoadSbieApi(cfg.sbPath);
+    if (sbieQuery) {
+        std::wcout << L"  [Sandboxie API] SbieApi_QueryProcess detected via SbieDll.dll" << std::endl;
+    } else {
+        std::wcout << L"  [Sandboxie API] SbieDll.dll not loaded, will use sequential fallback" << std::endl;
+    }
 
+    try {
+        if (cfg.batchMode) {
+            // ─────────────────────────────────────────────
+            // PHASE 1: Launch all Launchers first
+            // ─────────────────────────────────────────────
             std::wcout <<
-                L"\n  ┌──────────────────────────────────────────┐\n  │  PAIR "
-                << i << L": Launcher + Game"
-                L"                    │\n"
+                L"\n  ┌──────────────────────────────────────────┐\n"
+                L"  │  PHASE 1: Launching ALL Launchers        │\n"
                 L"  └──────────────────────────────────────────┘\n" << std::endl;
 
-            containers[i].id = i;
+            for (int i = 0; i < cfg.instances && !g_stop; i++) {
+                containers[i].id = i;
 
-            std::wstring jobName = L"Multibox_Launcher_Job_" + std::to_wstring(i);
-            HANDLE hJob = CreateJobObjectW(nullptr, jobName.c_str());
-            if (!hJob) Throw("CreateJobObject");
-            containers[i].hJob = HG(hJob);
+                std::wstring jobName = L"Multibox_Launcher_Job_" + std::to_wstring(i);
+                HANDLE hJob = CreateJobObjectW(nullptr, jobName.c_str());
+                if (!hJob) Throw("CreateJobObject");
+                containers[i].hJob = HG(hJob);
 
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jli = {};
-            jli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jli, sizeof(jli));
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION jli = {};
+                jli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jli, sizeof(jli));
 
-            std::wcout << L"  [" << i << L"] Starting Launcher..." << std::endl;
-            containers[i].launcher = LaunchLauncher(
-                launcherPath.wstring(), cfg.launcherArgs, launcherDir.wstring(),
-                hJob, i, cfg.dllPath);
-            std::wcout << L"      PID: " << containers[i].launcher.pid << std::endl;
+                std::wcout << L"  [" << i << L"] Starting Launcher..." << std::endl;
+                containers[i].launcher = LaunchLauncher(
+                    launcherPath.wstring(), cfg.launcherArgs, launcherDir.wstring(),
+                    hJob, i, cfg.dllPath);
+                std::wcout << L"      PID: " << containers[i].launcher.pid << std::endl;
 
-            Sleep(cfg.launcherDelay);
+                if (i < cfg.instances - 1 && !g_stop) {
+                    Sleep(cfg.launcherDelay);
+                }
+            }
+
             if (g_stop) goto shutdown;
 
+            // ─────────────────────────────────────────────
+            // PHASE 2: Wait for user confirmation
+            // ─────────────────────────────────────────────
             if (cfg.autoGames) {
-                std::wcout << L"  [" << i << L"] Auto: waiting " << cfg.autoDelay/1000 << L"s..." << std::endl;
+                std::wcout << L"\n  Auto: waiting " << cfg.autoDelay/1000 << L"s before launching games...\n" << std::endl;
                 Sleep(cfg.autoDelay);
             } else {
-                wchar_t prompt[128];
-                wsprintfW(prompt, L"  [%d] >>> Press Play in Launcher[%d], then press ENTER <<<", i, i);
-                WaitEnter(prompt);
+                std::wcout << std::endl;
+                WaitEnter(L"  >>> All Launchers ready! Press Play in each launcher, then press ENTER to start games <<<");
             }
             if (g_stop) goto shutdown;
 
-            std::wcout << L"  [" << i << L"] Starting Game in \"" << cfg.boxes[i] << L"\"..." << std::endl;
-            containers[i].game = LaunchGameInSandbox(
-                cfg.sbPath, gameExe.wstring(), cfg.gameDir,
-                i, cfg.boxes[i], cfg.gameExe, knownGamePids);
+            // ─────────────────────────────────────────────
+            // PHASE 2: Start ALL Games Simultaneously in Sandboxie
+            // ─────────────────────────────────────────────
+            std::wcout <<
+                L"\n  ┌──────────────────────────────────────────┐\n"
+                L"  │  PHASE 2: Starting ALL Games Instantly   │\n"
+                L"  └──────────────────────────────────────────┘\n" << std::endl;
 
-            if (i < cfg.instances - 1 && !g_stop) {
-                std::wcout << L"\n  Waiting " << cfg.pairDelay/1000 << L"s before next pair...\n" << std::endl;
-                Sleep(cfg.pairDelay);
+            for (int i = 0; i < cfg.instances && !g_stop; i++) {
+                std::wcout << L"  [" << i << L"] Launching Game in \"" << cfg.boxes[i] << L"\"..." << std::endl;
+                containers[i].game = StartGameInSandbox(
+                    cfg.sbPath, gameExe.wstring(), cfg.gameDir, cfg.boxes[i]);
+            }
+
+            ResolveAllGamePids(cfg, containers, knownGamePids, sbieQuery);
+
+        } else {
+            // ─────────────────────────────────────────────
+            // SEQUENTIAL PAIR MODE (original behavior)
+            // ─────────────────────────────────────────────
+            for (int i = 0; i < cfg.instances && !g_stop; i++) {
+
+                std::wcout <<
+                    L"\n  ┌──────────────────────────────────────────┐\n  │  PAIR "
+                    << i << L": Launcher + Game"
+                    L"                    │\n"
+                    L"  └──────────────────────────────────────────┘\n" << std::endl;
+
+                containers[i].id = i;
+
+                std::wstring jobName = L"Multibox_Launcher_Job_" + std::to_wstring(i);
+                HANDLE hJob = CreateJobObjectW(nullptr, jobName.c_str());
+                if (!hJob) Throw("CreateJobObject");
+                containers[i].hJob = HG(hJob);
+
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION jli = {};
+                jli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jli, sizeof(jli));
+
+                std::wcout << L"  [" << i << L"] Starting Launcher..." << std::endl;
+                containers[i].launcher = LaunchLauncher(
+                    launcherPath.wstring(), cfg.launcherArgs, launcherDir.wstring(),
+                    hJob, i, cfg.dllPath);
+                std::wcout << L"      PID: " << containers[i].launcher.pid << std::endl;
+
+                Sleep(cfg.launcherDelay);
+                if (g_stop) goto shutdown;
+
+                if (cfg.autoGames) {
+                    std::wcout << L"  [" << i << L"] Auto: waiting " << cfg.autoDelay/1000 << L"s..." << std::endl;
+                    Sleep(cfg.autoDelay);
+                } else {
+                    wchar_t prompt[128];
+                    wsprintfW(prompt, L"  [%d] >>> Press Play in Launcher[%d], then press ENTER <<<", i, i);
+                    WaitEnter(prompt);
+                }
+                if (g_stop) goto shutdown;
+
+                std::wcout << L"  [" << i << L"] Starting Game in \"" << cfg.boxes[i] << L"\"..." << std::endl;
+                containers[i].game = LaunchGameInSandbox(
+                    cfg.sbPath, gameExe.wstring(), cfg.gameDir,
+                    i, cfg.boxes[i], cfg.gameExe, knownGamePids, sbieQuery);
+
+                if (i < cfg.instances - 1 && !g_stop) {
+                    std::wcout << L"\n  Waiting " << cfg.pairDelay/1000 << L"s before next pair...\n" << std::endl;
+                    Sleep(cfg.pairDelay);
+                }
             }
         }
 
@@ -410,7 +608,7 @@ int wmain(int argc, wchar_t* argv[]) {
 
         std::wcout <<
             L"\n  ┌──────────────────────────────────────────┐\n"
-            L"  │  ALL PAIRS LAUNCHED                      │\n"
+            L"  │  ALL INSTANCES LAUNCHED                  │\n"
             L"  └──────────────────────────────────────────┘\n" << std::endl;
         std::wcout << L"  Close this window to stop.\n" << std::endl;
 
@@ -449,4 +647,3 @@ int wmain(int argc, wchar_t* argv[]) {
 #endif
     return 0;
 }
-
